@@ -8,6 +8,8 @@ import shutil
 import sys
 import webbrowser as wb
 from functools import partial
+import cv2
+import datetime
 
 try:
     from PyQt5.QtGui import *
@@ -297,6 +299,11 @@ class MainWindow(QMainWindow, WindowMixin):
         help_default = action(get_str('tutorialDefault'), self.show_default_tutorial_dialog, None, 'help', get_str('tutorialDetail'))
         show_info = action(get_str('info'), self.show_info_dialog, None, 'help', get_str('info'))
         show_shortcut = action(get_str('shortcut'), self.show_shortcuts_dialog, None, 'help', get_str('shortcut'))
+        
+        # 新增功能按钮
+        record_data = action('录制数据', self.record_data, None, 'file', '打开摄像头录制数据', enabled=True)
+        extract_data = action('提取数据', self.extract_data, None, 'file', '从视频中提取图像帧', enabled=True)
+        split_dataset = action('数据集切分', self.split_dataset, None, 'file', '切分数据集为训练集、验证集、测试集', enabled=True)
 
         zoom = QWidgetAction(self)
         zoom.setDefaultWidget(self.zoom_widget)
@@ -450,6 +457,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.tools = self.toolbar('Tools')
         self.actions.beginner = (
             open, open_dir, change_save_dir, open_next_image, open_prev_image, verify, save, save_format, None, create, copy, delete, None,
+            record_data, extract_data, split_dataset, None,
             zoom_in, zoom, zoom_out, fit_window, fit_width, None,
             light_brighten, light, light_darken, light_org)
 
@@ -1668,6 +1676,298 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def toggle_draw_square(self):
         self.canvas.set_drawing_shape_to_square(self.draw_squares_option.isChecked())
+    
+    def record_data(self, _value=False):
+        """打开摄像头录制数据并保存到指定文件夹"""
+        # 让用户选择保存目录
+        save_dir = ustr(QFileDialog.getExistingDirectory(self, '选择保存目录', '.', QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+        if not save_dir:
+            return
+        
+        # 生成视频文件名
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        video_filename = os.path.join(save_dir, f'record_{timestamp}.avi')
+        
+        # 打开默认摄像头
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            QMessageBox.warning(self, '错误', '无法打开摄像头')
+            return
+        
+        # 获取摄像头参数
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        
+        # 创建视频编码器
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(video_filename, fourcc, fps, (width, height))
+        
+        # 创建录制对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle('录制数据')
+        dialog.resize(400, 100)
+        
+        layout = QVBoxLayout()
+        info_label = QLabel(f'正在录制...\n保存路径: {video_filename}')
+        info_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(info_label)
+        
+        button_layout = QHBoxLayout()
+        stop_button = QPushButton('停止录制')
+        button_layout.addStretch()
+        button_layout.addWidget(stop_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+        
+        dialog.setLayout(layout)
+        
+        # 录制状态
+        is_recording = True
+        
+        def stop_recording():
+            nonlocal is_recording
+            is_recording = False
+            dialog.accept()
+        
+        stop_button.clicked.connect(stop_recording)
+        
+        # 在单独的线程中进行录制
+        def recording_thread():
+            while is_recording:
+                ret, frame = cap.read()
+                if ret:
+                    out.write(frame)
+                    # 显示录制中的帧
+                    cv2.imshow('Recording', frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+        
+        # 启动录制线程
+        import threading
+        record_thread = threading.Thread(target=recording_thread)
+        record_thread.daemon = True
+        record_thread.start()
+        
+        # 显示对话框
+        dialog.exec_()
+        
+        # 释放资源
+        cap.release()
+        out.release()
+        cv2.destroyAllWindows()
+        
+        self.statusBar().showMessage(f'录制完成，保存到: {video_filename}')
+    
+    def extract_data(self, _value=False):
+        """从视频中提取图像帧"""
+        # 让用户选择视频文件
+        video_path, _ = QFileDialog.getOpenFileName(self, '选择视频文件', '.', '视频文件 (*.avi *.mp4 *.mov *.mkv)')
+        if not video_path:
+            return
+        
+        # 让用户输入要提取的图像张数
+        n, ok = QInputDialog.getInt(self, '提取数据', '请输入要提取的图像张数:', min=1, max=1000)
+        if not ok:
+            return
+        
+        # 让用户选择保存目录
+        save_dir = ustr(QFileDialog.getExistingDirectory(self, '选择保存目录', '.', QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+        if not save_dir:
+            return
+        
+        # 打开视频文件
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            QMessageBox.warning(self, '错误', '无法打开视频文件')
+            return
+        
+        # 获取视频总帧数
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # 随机选择n个帧
+        import random
+        frame_indices = random.sample(range(total_frames), min(n, total_frames))
+        frame_indices.sort()
+        
+        # 提取并保存帧
+        extracted_count = 0
+        current_frame = 0
+        
+        while current_frame < total_frames and extracted_count < n:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            if current_frame in frame_indices:
+                # 保存帧
+                frame_filename = os.path.join(save_dir, f'frame_{extracted_count:04d}.jpg')
+                cv2.imwrite(frame_filename, frame)
+                extracted_count += 1
+            
+            current_frame += 1
+        
+        # 释放资源
+        cap.release()
+        
+        self.statusBar().showMessage(f'提取完成，共提取 {extracted_count} 张图像到: {save_dir}')
+    
+    def split_dataset(self, _value=False):
+        """切分数据集为训练集、验证集、测试集"""
+        # 创建切分对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle('数据集切分')
+        dialog.resize(400, 200)
+        
+        layout = QVBoxLayout()
+        
+        # 训练集比例
+        train_layout = QHBoxLayout()
+        train_layout.addWidget(QLabel('训练集比例:'))
+        train_spin = QDoubleSpinBox()
+        train_spin.setRange(0, 1)
+        train_spin.setValue(0.7)
+        train_spin.setSingleStep(0.1)
+        train_layout.addWidget(train_spin)
+        layout.addLayout(train_layout)
+        
+        # 验证集比例
+        val_layout = QHBoxLayout()
+        val_layout.addWidget(QLabel('验证集比例:'))
+        val_spin = QDoubleSpinBox()
+        val_spin.setRange(0, 1)
+        val_spin.setValue(0.15)
+        val_spin.setSingleStep(0.1)
+        val_layout.addWidget(val_spin)
+        layout.addLayout(val_layout)
+        
+        # 测试集比例
+        test_layout = QHBoxLayout()
+        test_layout.addWidget(QLabel('测试集比例:'))
+        test_spin = QDoubleSpinBox()
+        test_spin.setRange(0, 1)
+        test_spin.setValue(0.15)
+        test_spin.setSingleStep(0.1)
+        test_layout.addWidget(test_spin)
+        layout.addLayout(test_layout)
+        
+        # 选择源数据目录
+        src_dir = ''
+        def select_src_dir():
+            nonlocal src_dir
+            src_dir = ustr(QFileDialog.getExistingDirectory(self, '选择源数据目录', '.', QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+            src_dir_label.setText(f'源数据目录: {src_dir}')
+        
+        src_layout = QHBoxLayout()
+        src_dir_label = QLabel('源数据目录: 未选择')
+        src_dir_button = QPushButton('选择')
+        src_dir_button.clicked.connect(select_src_dir)
+        src_layout.addWidget(src_dir_label)
+        src_layout.addWidget(src_dir_button)
+        layout.addLayout(src_layout)
+        
+        # 选择保存目录
+        save_dir = ''
+        def select_save_dir():
+            nonlocal save_dir
+            save_dir = ustr(QFileDialog.getExistingDirectory(self, '选择保存目录', '.', QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+            save_dir_label.setText(f'保存目录: {save_dir}')
+        
+        save_layout = QHBoxLayout()
+        save_dir_label = QLabel('保存目录: 未选择')
+        save_dir_button = QPushButton('选择')
+        save_dir_button.clicked.connect(select_save_dir)
+        save_layout.addWidget(save_dir_label)
+        save_layout.addWidget(save_dir_button)
+        layout.addLayout(save_layout)
+        
+        # 确认和取消按钮
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton('确定')
+        cancel_button = QPushButton('取消')
+        button_layout.addStretch()
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+        
+        dialog.setLayout(layout)
+        
+        # 处理对话框结果
+        ok = False
+        def on_ok():
+            nonlocal ok
+            ok = True
+            dialog.accept()
+        
+        ok_button.clicked.connect(on_ok)
+        cancel_button.clicked.connect(dialog.reject)
+        
+        dialog.exec_()
+        
+        if not ok or not src_dir or not save_dir:
+            return
+        
+        # 获取比例
+        train_ratio = train_spin.value()
+        val_ratio = val_spin.value()
+        test_ratio = test_spin.value()
+        
+        # 检查比例是否合理
+        if abs(train_ratio + val_ratio + test_ratio - 1.0) > 0.001:
+            QMessageBox.warning(self, '警告', '比例总和不等于1，请重新输入')
+            return
+        
+        # 获取源目录中的图像文件
+        import glob
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif']
+        image_files = []
+        for ext in image_extensions:
+            image_files.extend(glob.glob(os.path.join(src_dir, ext)))
+        
+        if not image_files:
+            QMessageBox.warning(self, '错误', '源目录中没有找到图像文件')
+            return
+        
+        # 随机打乱图像文件
+        random.shuffle(image_files)
+        
+        # 计算各部分数量
+        total = len(image_files)
+        train_count = int(total * train_ratio)
+        val_count = int(total * val_ratio)
+        test_count = total - train_count - val_count
+        
+        # 创建保存目录
+        train_dir = os.path.join(save_dir, 'train')
+        val_dir = os.path.join(save_dir, 'val')
+        test_dir = os.path.join(save_dir, 'test')
+        
+        for dir_path in [train_dir, val_dir, test_dir]:
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+        
+        # 复制文件到对应目录
+        for i, img_path in enumerate(image_files):
+            filename = os.path.basename(img_path)
+            if i < train_count:
+                dest_dir = train_dir
+            elif i < train_count + val_count:
+                dest_dir = val_dir
+            else:
+                dest_dir = test_dir
+            
+            # 复制图像文件
+            shutil.copy2(img_path, os.path.join(dest_dir, filename))
+            
+            # 复制对应的标注文件
+            base_name = os.path.splitext(filename)[0]
+            for ext in ['.xml', '.txt', '.json']:
+                anno_path = os.path.join(src_dir, base_name + ext)
+                if os.path.exists(anno_path):
+                    shutil.copy2(anno_path, os.path.join(dest_dir, base_name + ext))
+        
+        self.statusBar().showMessage(f'数据集切分完成，保存到: {save_dir}')
+        self.statusBar().showMessage(f'训练集: {train_count} 张, 验证集: {val_count} 张, 测试集: {test_count} 张')
 
 def inverted(color):
     return QColor(*[255 - v for v in color.getRgb()])
