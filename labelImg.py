@@ -4,9 +4,11 @@ import argparse
 import codecs
 import os.path
 import platform
+import random
 import shutil
 import sys
 import webbrowser as wb
+from datetime import datetime
 from functools import partial
 
 try:
@@ -24,6 +26,17 @@ except ImportError:
     from PyQt4.QtGui import *
     from PyQt4.QtCore import *
 
+try:
+    from PyQt5.QtMultimedia import (QCamera, QCameraInfo, QMediaRecorder,
+                                    QMediaPlayer, QMediaContent, QVideoProbe,
+                                    QVideoFrame, QAbstractVideoBuffer)
+    from PyQt5.QtMultimediaWidgets import QCameraViewfinder, QVideoWidget
+    QT_MULTIMEDIA_AVAILABLE = True
+except ImportError:
+    QCamera = QCameraInfo = QMediaRecorder = QMediaPlayer = None
+    QMediaContent = QVideoProbe = QVideoFrame = QAbstractVideoBuffer = None
+    QCameraViewfinder = QVideoWidget = None
+    QT_MULTIMEDIA_AVAILABLE = False
 from libs.combobox import ComboBox
 from libs.default_label_combobox import DefaultLabelComboBox
 from libs.resources import *
@@ -49,6 +62,9 @@ from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
 
 __appname__ = 'labelImg'
+VIDEO_DURATION_TIMEOUT_MS = 5000
+FRAME_CAPTURE_TIMEOUT_MS = 3000
+EXTRACT_FRAME_NAME_PATTERN = 'frame_%04d.png'
 
 
 class WindowMixin(object):
@@ -68,6 +84,328 @@ class WindowMixin(object):
             add_actions(toolbar, actions)
         self.addToolBar(Qt.LeftToolBarArea, toolbar)
         return toolbar
+
+
+class RecordDataDialog(QDialog):
+
+    def __init__(self, parent, get_str, default_output_dir=None, status_callback=None):
+        super(RecordDataDialog, self).__init__(parent)
+        self.get_str = get_str
+        self.status_callback = status_callback
+        self.camera = None
+        self.recorder = None
+        self.output_path = None
+
+        self.setWindowTitle(get_str('recordDialogTitle'))
+        form_layout = QFormLayout()
+
+        self.output_dir_edit = QLineEdit(default_output_dir or '')
+        output_button = QPushButton('...')
+        output_button.clicked.connect(self.select_output_dir)
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(self.output_dir_edit)
+        output_layout.addWidget(output_button)
+        output_widget = QWidget()
+        output_widget.setLayout(output_layout)
+        form_layout.addRow(get_str('recordOutputDir'), output_widget)
+
+        self.file_name_edit = QLineEdit(self.default_filename())
+        form_layout.addRow(get_str('recordFileName'), self.file_name_edit)
+
+        self.viewfinder = QCameraViewfinder(self) if QCameraViewfinder else None
+        if self.viewfinder:
+            self.viewfinder.setMinimumHeight(200)
+
+        self.status_label = QLabel()
+
+        self.record_button = new_button(get_str('recordStart'), slot=self.start_recording)
+        self.stop_button = new_button(get_str('recordStop'), slot=self.stop_recording)
+        self.stop_button.setEnabled(False)
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.record_button)
+        button_layout.addWidget(self.stop_button)
+
+        close_buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        close_buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form_layout)
+        if self.viewfinder:
+            layout.addWidget(self.viewfinder)
+        layout.addWidget(self.status_label)
+        layout.addLayout(button_layout)
+        layout.addWidget(close_buttons)
+        self.setLayout(layout)
+
+        self.setup_camera()
+
+    def default_filename(self):
+        return 'recording_%s.mp4' % datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    def select_output_dir(self):
+        directory = ustr(QFileDialog.getExistingDirectory(self, self.get_str('recordDialogTitle'),
+                                                          self.output_dir_edit.text() or '.',
+                                                          QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+        if directory:
+            self.output_dir_edit.setText(directory)
+
+    def setup_camera(self):
+        if not QT_MULTIMEDIA_AVAILABLE:
+            self.status_label.setText(self.get_str('recordNoMultimedia'))
+            self.record_button.setEnabled(False)
+            return
+        cameras = QCameraInfo.availableCameras() if QCameraInfo else []
+        if not cameras:
+            self.status_label.setText(self.get_str('recordNoCamera'))
+            self.record_button.setEnabled(False)
+            return
+        self.camera = QCamera(cameras[0])
+        if self.viewfinder:
+            self.camera.setViewfinder(self.viewfinder)
+        self.recorder = QMediaRecorder(self.camera)
+        self.camera.start()
+        self.status_label.setText(self.get_str('recordStatusReady'))
+
+    def start_recording(self):
+        if not self.recorder:
+            self.show_error(self.get_str('recordNoMultimedia'))
+            return
+        output_dir = ustr(self.output_dir_edit.text()).strip()
+        file_name = ustr(self.file_name_edit.text()).strip()
+        if not output_dir or not os.path.isdir(output_dir) or not file_name:
+            self.show_error(self.get_str('recordInvalidOutput'))
+            return
+        if not os.path.splitext(file_name)[1]:
+            file_name += '.mp4'
+        self.output_path = os.path.abspath(os.path.join(output_dir, file_name))
+        self.recorder.setOutputLocation(QUrl.fromLocalFile(self.output_path))
+        self.recorder.record()
+        self.record_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        status = self.get_str('recordStatusRecording')
+        self.status_label.setText(status)
+        self.update_status(status)
+
+    def stop_recording(self):
+        if self.recorder:
+            self.recorder.stop()
+        self.record_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        status = self.get_str('recordStatusStopped')
+        if self.output_path:
+            status = self.get_str('recordStatusSaved') % self.output_path
+        self.status_label.setText(status)
+        self.update_status(status)
+
+    def update_status(self, message):
+        if self.status_callback:
+            self.status_callback(message)
+
+    def show_error(self, message):
+        QMessageBox.critical(self, self.get_str('dataErrorTitle'), message)
+        self.update_status(message)
+
+    def reject(self):
+        if self.recorder and self.recorder.state() == QMediaRecorder.RecordingState:
+            self.recorder.stop()
+        if self.camera:
+            self.camera.stop()
+        super(RecordDataDialog, self).reject()
+
+
+class ExtractFramesDialog(QDialog):
+
+    def __init__(self, parent, get_str, default_output_dir=None):
+        super(ExtractFramesDialog, self).__init__(parent)
+        self.get_str = get_str
+        self.setWindowTitle(get_str('extractDialogTitle'))
+
+        self.video_path_edit = QLineEdit()
+        video_button = QPushButton('...')
+        video_button.clicked.connect(self.select_video_file)
+        video_layout = QHBoxLayout()
+        video_layout.addWidget(self.video_path_edit)
+        video_layout.addWidget(video_button)
+        video_widget = QWidget()
+        video_widget.setLayout(video_layout)
+
+        self.frame_count_spin = QSpinBox()
+        self.frame_count_spin.setRange(1, 100000)
+        self.frame_count_spin.setValue(10)
+
+        self.output_dir_edit = QLineEdit(default_output_dir or '')
+        output_button = QPushButton('...')
+        output_button.clicked.connect(self.select_output_dir)
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(self.output_dir_edit)
+        output_layout.addWidget(output_button)
+        output_widget = QWidget()
+        output_widget.setLayout(output_layout)
+
+        form_layout = QFormLayout()
+        form_layout.addRow(get_str('extractVideoFile'), video_widget)
+        form_layout.addRow(get_str('extractFrameCount'), self.frame_count_spin)
+        form_layout.addRow(get_str('extractOutputDir'), output_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form_layout)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def select_video_file(self):
+        filename = ustr(QFileDialog.getOpenFileName(self, self.get_str('extractDialogTitle'),
+                                                    self.video_path_edit.text() or '.',
+                                                    self.get_str('extractVideoFilter')))
+        if filename:
+            if isinstance(filename, (tuple, list)):
+                filename = filename[0]
+            self.video_path_edit.setText(filename)
+
+    def select_output_dir(self):
+        directory = ustr(QFileDialog.getExistingDirectory(self, self.get_str('extractDialogTitle'),
+                                                          self.output_dir_edit.text() or '.',
+                                                          QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+        if directory:
+            self.output_dir_edit.setText(directory)
+
+    def accept(self):
+        video_path = ustr(self.video_path_edit.text()).strip()
+        output_dir = ustr(self.output_dir_edit.text()).strip()
+        if not video_path or not os.path.isfile(video_path):
+            QMessageBox.warning(self, self.get_str('dataWarningTitle'),
+                                self.get_str('extractInvalidVideo'))
+            return
+        if not output_dir:
+            QMessageBox.warning(self, self.get_str('dataWarningTitle'),
+                                self.get_str('extractInvalidOutput'))
+            return
+        super(ExtractFramesDialog, self).accept()
+
+    def values(self):
+        return (ustr(self.video_path_edit.text()).strip(),
+                self.frame_count_spin.value(),
+                ustr(self.output_dir_edit.text()).strip())
+
+
+class DatasetSplitDialog(QDialog):
+
+    def __init__(self, parent, get_str, default_input_dir=None, default_output_dir=None):
+        super(DatasetSplitDialog, self).__init__(parent)
+        self.get_str = get_str
+        self.setWindowTitle(get_str('datasetSplitDialogTitle'))
+
+        self.input_dir_edit = QLineEdit(default_input_dir or '')
+        input_button = QPushButton('...')
+        input_button.clicked.connect(self.select_input_dir)
+        input_layout = QHBoxLayout()
+        input_layout.addWidget(self.input_dir_edit)
+        input_layout.addWidget(input_button)
+        input_widget = QWidget()
+        input_widget.setLayout(input_layout)
+
+        self.output_dir_edit = QLineEdit(default_output_dir or '')
+        output_button = QPushButton('...')
+        output_button.clicked.connect(self.select_output_dir)
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(self.output_dir_edit)
+        output_layout.addWidget(output_button)
+        output_widget = QWidget()
+        output_widget.setLayout(output_layout)
+
+        self.train_ratio = QDoubleSpinBox()
+        self.train_ratio.setRange(0.0, 1.0)
+        self.train_ratio.setSingleStep(0.05)
+        self.train_ratio.setDecimals(2)
+        self.train_ratio.setValue(0.7)
+
+        self.val_ratio = QDoubleSpinBox()
+        self.val_ratio.setRange(0.0, 1.0)
+        self.val_ratio.setSingleStep(0.05)
+        self.val_ratio.setDecimals(2)
+        self.val_ratio.setValue(0.2)
+
+        self.test_ratio = QDoubleSpinBox()
+        self.test_ratio.setRange(0.0, 1.0)
+        self.test_ratio.setSingleStep(0.05)
+        self.test_ratio.setDecimals(2)
+        self.test_ratio.setValue(0.1)
+
+        form_layout = QFormLayout()
+        form_layout.addRow(get_str('datasetSplitInputDir'), input_widget)
+        form_layout.addRow(get_str('datasetSplitOutputDir'), output_widget)
+        form_layout.addRow(get_str('datasetSplitTrainRatio'), self.train_ratio)
+        form_layout.addRow(get_str('datasetSplitValRatio'), self.val_ratio)
+        form_layout.addRow(get_str('datasetSplitTestRatio'), self.test_ratio)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form_layout)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def select_input_dir(self):
+        directory = ustr(QFileDialog.getExistingDirectory(self, self.get_str('datasetSplitDialogTitle'),
+                                                          self.input_dir_edit.text() or '.',
+                                                          QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+        if directory:
+            self.input_dir_edit.setText(directory)
+
+    def select_output_dir(self):
+        directory = ustr(QFileDialog.getExistingDirectory(self, self.get_str('datasetSplitDialogTitle'),
+                                                          self.output_dir_edit.text() or '.',
+                                                          QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+        if directory:
+            self.output_dir_edit.setText(directory)
+
+    def accept(self):
+        input_dir = ustr(self.input_dir_edit.text()).strip()
+        output_dir = ustr(self.output_dir_edit.text()).strip()
+        if not input_dir or not os.path.isdir(input_dir):
+            QMessageBox.warning(self, self.get_str('dataWarningTitle'),
+                                self.get_str('datasetSplitInvalidInput'))
+            return
+        if not output_dir:
+            QMessageBox.warning(self, self.get_str('dataWarningTitle'),
+                                self.get_str('datasetSplitInvalidOutput'))
+            return
+        total_ratio = self.train_ratio.value() + self.val_ratio.value() + self.test_ratio.value()
+        if total_ratio <= 0:
+            QMessageBox.warning(self, self.get_str('dataWarningTitle'),
+                                self.get_str('datasetSplitInvalidRatio'))
+            return
+        super(DatasetSplitDialog, self).accept()
+
+    def values(self):
+        return (ustr(self.input_dir_edit.text()).strip(),
+                ustr(self.output_dir_edit.text()).strip(),
+                self.train_ratio.value(),
+                self.val_ratio.value(),
+                self.test_ratio.value())
+
+
+def video_frame_to_image(frame):
+    if not QT_MULTIMEDIA_AVAILABLE or not frame or not QVideoFrame:
+        return None
+    video_frame = QVideoFrame(frame)
+    if not video_frame.isValid():
+        return None
+    if not video_frame.map(QAbstractVideoBuffer.ReadOnly):
+        return None
+    image_format = QVideoFrame.imageFormatFromPixelFormat(video_frame.pixelFormat())
+    if image_format == QImage.Format_Invalid:
+        video_frame.unmap()
+        return None
+    image = QImage(video_frame.bits(), video_frame.width(), video_frame.height(),
+                   video_frame.bytesPerLine(), image_format).copy()
+    video_frame.unmap()
+    return image
 
 
 class MainWindow(QMainWindow, WindowMixin):
@@ -226,6 +564,15 @@ class MainWindow(QMainWindow, WindowMixin):
         change_save_dir = action(get_str('changeSaveDir'), self.change_save_dir_dialog,
                                  'Ctrl+r', 'open', get_str('changeSavedAnnotationDir'))
 
+        record_data = action(get_str('recordData'), self.record_data,
+                             None, 'new', get_str('recordDataDetail'))
+
+        extract_data = action(get_str('extractData'), self.extract_data,
+                              None, 'open', get_str('extractDataDetail'))
+
+        dataset_split = action(get_str('datasetSplit'), self.dataset_split,
+                               None, 'save-as', get_str('datasetSplitDetail'))
+
         open_annotation = action(get_str('openAnnotation'), self.open_annotation_dialog,
                                  'Ctrl+Shift+O', 'open', get_str('openAnnotationDetail'))
         copy_prev_bounding = action(get_str('copyPrevBounding'), self.copy_previous_bounding_boxes, 'Ctrl+v', 'copy', get_str('copyPrevBounding'))
@@ -381,6 +728,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Store actions for further handling.
         self.actions = Struct(save=save, save_format=save_format, saveAs=save_as, open=open, close=close, resetAll=reset_all, deleteImg=delete_image,
+                              recordData=record_data, extractData=extract_data, datasetSplit=dataset_split,
                               lineColor=color1, create=create, delete=delete, edit=edit, copy=copy,
                               createMode=create_mode, editMode=edit_mode, advancedMode=advanced_mode,
                               shapeLineColor=shape_line_color, shapeFillColor=shape_fill_color,
@@ -390,7 +738,7 @@ class MainWindow(QMainWindow, WindowMixin):
                               lightBrighten=light_brighten, lightDarken=light_darken, lightOrg=light_org,
                               lightActions=light_actions,
                               fileMenuActions=(
-                                  open, open_dir, save, save_as, close, reset_all, quit),
+                                  open, open_dir, record_data, extract_data, dataset_split, save, save_as, close, reset_all, quit),
                               beginner=(), advanced=(),
                               editMenu=(edit, copy, delete,
                                         None, color1, self.draw_squares_option),
@@ -427,7 +775,9 @@ class MainWindow(QMainWindow, WindowMixin):
         self.display_label_option.triggered.connect(self.toggle_paint_labels_option)
 
         add_actions(self.menus.file,
-                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
+                    (open, open_dir, change_save_dir, open_annotation, record_data, extract_data,
+                     dataset_split, copy_prev_bounding, self.menus.recentFiles, save, save_format,
+                     save_as, close, reset_all, delete_image, quit))
         add_actions(self.menus.help, (help_default, show_info, show_shortcut))
         add_actions(self.menus.view, (
             self.auto_saving,
@@ -449,12 +799,14 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.tools = self.toolbar('Tools')
         self.actions.beginner = (
-            open, open_dir, change_save_dir, open_next_image, open_prev_image, verify, save, save_format, None, create, copy, delete, None,
+            open, open_dir, change_save_dir, record_data, extract_data, dataset_split,
+            open_next_image, open_prev_image, verify, save, save_format, None, create, copy, delete, None,
             zoom_in, zoom, zoom_out, fit_window, fit_width, None,
             light_brighten, light, light_darken, light_org)
 
         self.actions.advanced = (
-            open, open_dir, change_save_dir, open_next_image, open_prev_image, save, save_format, None,
+            open, open_dir, change_save_dir, record_data, extract_data, dataset_split,
+            open_next_image, open_prev_image, save, save_format, None,
             create_mode, edit_mode, None,
             hide_all, show_all)
 
@@ -1375,6 +1727,170 @@ class MainWindow(QMainWindow, WindowMixin):
         for imgPath in self.m_img_list:
             item = QListWidgetItem(imgPath)
             self.file_list_widget.addItem(item)
+
+    def record_data(self, _value=False):
+        default_dir = self.last_open_dir or self.current_path()
+        dialog = RecordDataDialog(self, self.string_bundle.get_string, default_dir, self.status)
+        dialog.exec_()
+
+    def extract_data(self, _value=False):
+        default_dir = self.last_open_dir or self.current_path()
+        dialog = ExtractFramesDialog(self, self.string_bundle.get_string, default_dir)
+        if dialog.exec_():
+            video_path, frame_count, output_dir = dialog.values()
+            self.extract_frames_from_video(video_path, frame_count, output_dir)
+
+    def dataset_split(self, _value=False):
+        default_dir = self.last_open_dir or self.current_path()
+        dialog = DatasetSplitDialog(self, self.string_bundle.get_string, default_dir, default_dir)
+        if dialog.exec_():
+            input_dir, output_dir, train_ratio, val_ratio, test_ratio = dialog.values()
+            self.split_dataset_from_dir(input_dir, output_dir, train_ratio, val_ratio, test_ratio)
+
+    def extract_frames_from_video(self, video_path, frame_count, output_dir):
+        get_str = self.string_bundle.get_string
+        if not QT_MULTIMEDIA_AVAILABLE or not QMediaPlayer or not QMediaContent or not QVideoProbe:
+            self.error_message(get_str('dataErrorTitle'), get_str('extractNoMultimedia'))
+            self.status(get_str('extractNoMultimedia'))
+            return
+        video_path = os.path.abspath(video_path)
+        output_dir = os.path.abspath(output_dir)
+        if not os.path.isfile(video_path):
+            self.error_message(get_str('dataErrorTitle'), get_str('extractInvalidVideo'))
+            self.status(get_str('extractInvalidVideo'))
+            return
+        if frame_count <= 0:
+            self.error_message(get_str('dataErrorTitle'), get_str('extractInvalidCount'))
+            self.status(get_str('extractInvalidCount'))
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        player = QMediaPlayer(self)
+        player.setMuted(True)
+        video_widget = QVideoWidget(self) if QVideoWidget else None
+        if video_widget:
+            video_widget.hide()
+            player.setVideoOutput(video_widget)
+        probe = QVideoProbe(self)
+        if not probe.setSource(player):
+            self.error_message(get_str('dataErrorTitle'), get_str('extractNoMultimedia'))
+            self.status(get_str('extractNoMultimedia'))
+            return
+        player.setMedia(QMediaContent(QUrl.fromLocalFile(video_path)))
+        duration = self.wait_for_video_duration(player)
+        if duration is None or duration <= 0:
+            self.error_message(get_str('dataErrorTitle'), get_str('extractInvalidVideo'))
+            self.status(get_str('extractInvalidVideo'))
+            return
+        duration_ms = int(duration)
+        # Use millisecond positions as a proxy when frame count is unavailable.
+        sample_pool = max(1, duration_ms)
+        try:
+            positions = sorted(random.sample(range(sample_pool), frame_count))
+        except ValueError:
+            self.error_message(get_str('dataErrorTitle'), get_str('extractTooManyFrames'))
+            self.status(get_str('extractTooManyFrames'))
+            return
+        for index, position in enumerate(positions, start=1):
+            image = self.capture_video_frame(player, probe, position)
+            if image is None:
+                self.error_message(get_str('dataErrorTitle'), get_str('extractFailed'))
+                self.status(get_str('extractFailed'))
+                return
+            output_path = os.path.join(output_dir, EXTRACT_FRAME_NAME_PATTERN % index)
+            image.save(output_path)
+        self.status(get_str('extractComplete') % (frame_count, output_dir))
+
+    def wait_for_video_duration(self, player):
+        loop = QEventLoop()
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+
+        def handle_duration(duration):
+            if duration > 0:
+                loop.quit()
+
+        def handle_status(status):
+            if status == QMediaPlayer.InvalidMedia:
+                loop.quit()
+
+        player.durationChanged.connect(handle_duration)
+        player.mediaStatusChanged.connect(handle_status)
+        timeout.timeout.connect(loop.quit)
+        timeout.start(VIDEO_DURATION_TIMEOUT_MS)
+        player.play()
+        loop.exec_()
+        player.pause()
+        timeout.stop()
+        return player.duration()
+
+    def capture_video_frame(self, player, probe, position):
+        loop = QEventLoop()
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+        captured = {'image': None}
+
+        def handle_frame(frame):
+            if captured['image'] is not None:
+                return
+            image = video_frame_to_image(frame)
+            if image is None:
+                return
+            captured['image'] = image
+            loop.quit()
+
+        probe.videoFrameProbed.connect(handle_frame)
+        timeout.timeout.connect(loop.quit)
+        player.setPosition(position)
+        player.play()
+        timeout.start(FRAME_CAPTURE_TIMEOUT_MS)
+        loop.exec_()
+        player.pause()
+        probe.videoFrameProbed.disconnect(handle_frame)
+        timeout.stop()
+        return captured['image']
+
+    def split_dataset_from_dir(self, input_dir, output_dir, train_ratio, val_ratio, test_ratio):
+        get_str = self.string_bundle.get_string
+        input_dir = os.path.abspath(input_dir)
+        output_dir = os.path.abspath(output_dir)
+        if not os.path.isdir(input_dir):
+            self.error_message(get_str('dataErrorTitle'), get_str('datasetSplitInvalidInput'))
+            self.status(get_str('datasetSplitInvalidInput'))
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        images = self.scan_all_images(input_dir)
+        if not images:
+            self.error_message(get_str('dataErrorTitle'), get_str('datasetSplitNoImages'))
+            self.status(get_str('datasetSplitNoImages'))
+            return
+        total_ratio = train_ratio + val_ratio + test_ratio
+        if total_ratio <= 0:
+            self.error_message(get_str('dataErrorTitle'), get_str('datasetSplitInvalidRatio'))
+            self.status(get_str('datasetSplitInvalidRatio'))
+            return
+        random.shuffle(images)
+        train_count = int(len(images) * train_ratio / total_ratio)
+        val_count = int(len(images) * val_ratio / total_ratio)
+        split_map = {
+            'train': images[:train_count],
+            'val': images[train_count:train_count + val_count],
+            'test': images[train_count + val_count:]
+        }
+        for split_name, split_images in split_map.items():
+            for image_path in split_images:
+                rel_path = os.path.relpath(image_path, input_dir)
+                dest_image_path = os.path.join(output_dir, split_name, rel_path)
+                os.makedirs(os.path.dirname(dest_image_path), exist_ok=True)
+                shutil.copy2(image_path, dest_image_path)
+                base_path = os.path.splitext(image_path)[0]
+                for ext in (XML_EXT, TXT_EXT, JSON_EXT):
+                    annotation_path = base_path + ext
+                    if os.path.exists(annotation_path):
+                        dest_annotation_path = os.path.join(output_dir, split_name,
+                                                            os.path.relpath(annotation_path, input_dir))
+                        os.makedirs(os.path.dirname(dest_annotation_path), exist_ok=True)
+                        shutil.copy2(annotation_path, dest_annotation_path)
+        self.status(get_str('datasetSplitComplete') % output_dir)
 
     def verify_image(self, _value=False):
         # Proceeding next image without dialog if having any label
